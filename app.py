@@ -710,6 +710,589 @@ def make_results_plot(analyzer, crr, rho, mass, wind_ms):
 # Streamlit UI
 # ===========================================================================
 
+def _background_cda_closures(analyzer, mass, crr, rho, wind_ms=0.0):
+    """
+    Runs a silent CdA optimisation and returns only the VE closures.
+    Does NOT expose the CdA value — that stays behind the payment gate.
+    Returns list of closure values in metres, or None on failure.
+    """
+    import copy
+    try:
+        probe = copy.copy(analyzer)           # shallow copy — shares raw_data
+        probe.segment_data       = analyzer.segment_data
+        probe.turnaround_indices = list(analyzer.turnaround_indices)
+        probe.legs               = []
+        probe.pairs              = []
+        probe.leg_closures       = []
+        probe.gps_closures       = []
+        probe.cda_result         = None
+        probe.virtual_elevation  = None
+
+        probe.build_legs(trim=10)
+        if not probe.pairs:
+            return None
+
+        # Run the same two-pass grid search as calculate_cda()
+        grid = np.linspace(0.10, 0.70, 200)   # coarser for speed
+        errs = [probe._objective(c, crr, mass, rho, wind_ms) for c in grid]
+        best = grid[np.argmin(errs)]
+        fine = np.linspace(max(0.05, best - 0.05), min(0.80, best + 0.05), 200)
+        errs_f = [probe._objective(c, crr, mass, rho, wind_ms) for c in fine]
+        opt_cda = fine[np.argmin(errs_f)]
+
+        closures = []
+        for o, b in probe.pairs:
+            d_o = probe._leg_delta(o, opt_cda, crr, mass, rho, +wind_ms)
+            d_b = probe._leg_delta(b, opt_cda, crr, mass, rho, -wind_ms)
+            closures.append(d_o + d_b)
+        return closures
+    except Exception:
+        return None
+
+
+def estimate_tt_time(cda, mass, crr, rho, power_w, distance_m=40000):
+    """
+    Solve for constant speed on flat ground given power and CdA.
+    Returns time in seconds.
+    """
+    from numpy.polynomial import polynomial as P
+    g = 9.81
+    # Rearranged: 0.5*rho*cda*v^3 + crr*mass*g*v - power = 0
+    # numpy roots for: a*v^3 + 0*v^2 + b*v + c = 0
+    a = 0.5 * rho * cda
+    b = crr * mass * g
+    c = -power_w
+    coeffs = [a, 0, b, c]  # descending order
+    roots = np.roots(coeffs)
+    # Take the single real positive root
+    real_roots = [r.real for r in roots if abs(r.imag) < 1e-6 and r.real > 0]
+    if not real_roots:
+        return None
+    v = max(real_roots)
+    return distance_m / v
+
+def compare_cda(cda_a, cda_b, mass, crr, rho, power_w, distance_m=40000):
+    """
+    Returns dict with TT times and delta for both CdA values.
+    """
+    t_a = estimate_tt_time(cda_a, mass, crr, rho, power_w, distance_m)
+    t_b = estimate_tt_time(cda_b, mass, crr, rho, power_w, distance_m)
+    if t_a is None or t_b is None:
+        return None
+    delta_s  = t_b - t_a   # positive = B is slower
+    v_a      = distance_m / t_a
+    v_b      = distance_m / t_b
+    return {
+        'time_a':    t_a,
+        'time_b':    t_b,
+        'delta_s':   delta_s,
+        'speed_a':   v_a * 3.6,
+        'speed_b':   v_b * 3.6,
+    }
+
+def check_data_quality(analyzer, mass=75.0, crr=0.0031, rho=1.225, wind_ms=0.0):
+    """
+    Analyzes the loaded FIT data and returns a quality verdict
+    before allowing a paid CdA analysis.
+
+    Returns a dict with per-check results and an overall verdict.
+    """
+    df = analyzer.raw_data
+    checks = {}
+
+    # ── 1. Duration ──────────────────────────────────────────────────────────
+    duration_s = float(df['time'].iloc[-1])
+    checks['duration'] = {
+        'label': f'Ride duration: {duration_s / 60:.1f} min',
+        'pass': duration_s >= 300,  # ≥ 5 minutes
+        'warning': 180 <= duration_s < 300,  # 3-5 min = borderline
+        'detail': 'Minimum 5 minutes recommended for a valid CdA test.',
+    }
+
+    # ── 2. Power meter presence ───────────────────────────────────────────────
+    power_valid_pct = (df['power'].notna() & (df['power'] > 0)).sum() / len(df) * 100
+    checks['power_quality'] = {
+        'label': f'Valid power data: {power_valid_pct:.1f}%',
+        'pass': power_valid_pct >= 90,
+        'warning': 70 <= power_valid_pct < 90,
+        'detail': 'Power meter required with >90% valid (non-zero) data.',
+    }
+
+    # ── 3. Average speed (only moving segments) ───────────────────────────────
+    moving = df[df['speed'] > 2.0]
+    avg_spd_kmh = moving['speed'].mean() * 3.6 if len(moving) > 0 else 0
+    checks['avg_speed'] = {
+        'label': f'Avg moving speed: {avg_spd_kmh:.1f} km/h',
+        'pass': avg_spd_kmh >= 25.0,
+        'warning': 20.0 <= avg_spd_kmh < 25.0,
+        'detail': 'CdA test requires sustained speed ≥ 25 km/h. Below 25 km/h, rolling resistance noise masks aerodynamic drag.',
+    }
+
+    # ── 4. Speed consistency (Coefficient of Variation) ───────────────────────
+    if len(moving) > 10:
+        speed_cv = moving['speed'].std() / moving['speed'].mean()
+    else:
+        speed_cv = 1.0
+    checks['speed_consistency'] = {
+        'label': f'Speed consistency (CV): {speed_cv:.3f}',
+        'pass': speed_cv <= 0.30,
+        'warning': 0.30 < speed_cv <= 0.50,
+        'detail': 'CV < 0.30 = steady pacing. High CV = braking/surging = unreliable CdA.',
+    }
+
+    # ── 5. GPS data present ───────────────────────────────────────────────────
+    has_gps = ('latitude' in df.columns and df['latitude'].notna().any())
+    checks['gps'] = {
+        'label': 'GPS data: ' + ('✓ Available' if has_gps else '✗ Not found'),
+        'pass': has_gps,
+        'warning': False,
+        'detail': 'GPS required for turnaround detection and route validation.',
+    }
+
+    # ── 6. Turnaround detection ───────────────────────────────────────────────
+    analyzer.set_segment(0, len(df) - 1)
+    turns = analyzer.detect_turnarounds()
+    n_turns = len(turns)
+
+    if n_turns >= 1:
+        analyzer.build_legs(trim=10)  # ← add this line
+
+    checks['turnarounds'] = {
+        'label': f'Turnarounds detected: {n_turns}',
+        'pass': n_turns >= 1,
+        'warning': False,
+        'detail': 'At least 1 turnaround required for out-and-back (Chung) method.',
+    }
+
+    # ── 6b. VE loop closures (background CdA run — no CdA value shown) ────────
+    if n_turns >= 1:
+        bg_closures = _background_cda_closures(
+            analyzer, mass=mass, crr=crr, rho=rho, wind_ms=wind_ms)
+        if bg_closures:
+            max_closure = max(abs(c) for c in bg_closures)
+            closure_strs = ', '.join(f'{c:+.3f}m' for c in bg_closures)
+            checks['ve_closure'] = {
+                'label': f'VE loop closures: {closure_strs}',
+                'pass': max_closure < 0.05,
+                'warning': 0.05 <= max_closure < 0.10,
+                'detail': (
+                    f'Max closure = {max_closure:.3f} m. '
+                    'Values < 0.05 m = excellent. 0.05–0.10 m = acceptable. '
+                    '>0.10 m = poor conditions, re-test recommended.'
+                ),
+            }
+        else:
+            checks['ve_closure'] = {
+                'label': 'VE closure check: could not run (not enough legs)',
+                'pass': False,
+                'warning': True,
+                'detail': 'Background CdA optimisation failed — verify turnaround detection.',
+            }
+    else:
+        checks['ve_closure'] = {
+            'label': 'VE closure check: skipped (no turnarounds)',
+            'pass': False,
+            'warning': False,  # this is a real FAIL — data has no pairs at all
+            'detail': 'Cannot evaluate VE closures without at least 1 out-and-back pair.',
+        }
+
+
+    # ── 7. Power steadiness ───────────────────────────────────────────────────
+    avg_power_cv = df['power'].std() / (df['power'].mean() + 1e-6)
+    checks['power_steadiness'] = {
+        'label': f'Power steadiness (CV): {avg_power_cv:.3f}',
+        'pass': avg_power_cv <= 0.60,
+        'warning': 0.60 < avg_power_cv <= 0.90,
+        'detail': 'Very erratic power (CV > 0.90) reduces CdA accuracy.',
+    }
+
+    # ── 8. Heading anti-parallel (out vs back ≈ 180°) ────────────────────────
+    # Only meaningful if GPS + at least 1 turnaround was found
+    if has_gps and n_turns >= 1 and 'heading' in df.columns:
+        legs_temp = analyzer.legs  # already built by set_segment + detect above
+        if len(legs_temp) >= 2:
+            pair_heading_diffs = []
+            for k in range(0, len(legs_temp) - 1, 2):
+                out_hdg = circular_mean(legs_temp[k]['heading'].dropna().values)
+                back_hdg = circular_mean(legs_temp[k + 1]['heading'].dropna().values)
+                pair_heading_diffs.append(angle_diff(out_hdg, back_hdg))
+            worst_diff = max(pair_heading_diffs) if pair_heading_diffs else 0
+            anti_ok = worst_diff >= 135  # should be near 180°
+            checks['heading_antiparallel'] = {
+                'label': f'Out/back heading diff: {worst_diff:.0f}°  (need ≥135°)',
+                'pass': anti_ok,
+                'warning': not anti_ok and worst_diff >= 100,
+                'detail': 'Out and back legs must go in opposite directions. Figure-8 or lollipop routes will produce unreliable CdA.',
+            }
+        else:
+            checks['heading_antiparallel'] = {
+                'label': 'Heading check: not enough legs to evaluate',
+                'pass': False,
+                'warning': True,
+                'detail': 'Could not verify out/back heading — need at least 2 legs.',
+            }
+    else:
+        checks['heading_antiparallel'] = {
+            'label': 'Heading check: skipped (no GPS or no turns)',
+            'pass': False,
+            'warning': True,
+            'detail': 'GPS heading required to verify out-and-back geometry.',
+        }
+
+    # ── 9. Pair count ≥ 3 (statistical reliability) ──────────────────────────
+    n_pairs = len(analyzer.pairs)
+    checks['pair_count'] = {
+        'label': f'Out-and-back pairs: {n_pairs}  (recommended ≥ 3)',
+        'pass': n_pairs >= 3,
+        'warning': n_pairs == 2,
+        'detail': 'More pairs = more reliable CdA average. 1 pair is very sensitive to a single gust or power spike.',
+    }
+
+    # ── 10. Route flatness (altitude balance per pair) ────────────────────────
+    if has_gps and 'altitude' in df.columns and df['altitude'].notna().any():
+        alt_drifts = []
+        for out_leg, back_leg in analyzer.pairs:
+            if 'altitude' not in out_leg.columns:
+                continue
+            alt_start = out_leg['altitude'].iloc[0]
+            alt_end = back_leg['altitude'].iloc[-1]
+            if not pd.isna(alt_start) and not pd.isna(alt_end):
+                alt_drifts.append(abs(alt_end - alt_start))
+        if alt_drifts:
+            max_drift = max(alt_drifts)
+            checks['route_flatness'] = {
+                'label': f'Max altitude drift per pair: {max_drift:.1f} m  (need < 10 m)',
+                'pass': max_drift < 10.0,
+                'warning': 10.0 <= max_drift < 20.0,
+                'detail': 'Start and end of each out-and-back pair must be at the same altitude. Large drift = route is not flat = VE closure error is structural.',
+            }
+        else:
+            checks['route_flatness'] = {
+                'label': 'Route flatness: altitude data missing in legs',
+                'pass': False,
+                'warning': True,
+                'detail': 'Could not evaluate altitude balance — check altitude data.',
+            }
+    else:
+        checks['route_flatness'] = {
+            'label': 'Route flatness: no altitude data available',
+            'pass': False,
+            'warning': True,
+            'detail': 'GPS altitude required to verify route flatness.',
+        }
+
+
+
+    # ── Overall score ─────────────────────────────────────────────────────────
+    # ── Hard blockers — GPS and turnarounds must always be FAIL, never WARNING ──
+    HARD_BLOCKERS = ['gps', 'turnarounds']
+    has_hard_fail = any(
+        not checks[k]['pass'] for k in HARD_BLOCKERS if k in checks
+    )
+
+    # ── Overall score (fixed denominator: always 8 checks) ───────────────────
+    FIXED_TOTAL = 11  # keep constant so scores are comparable across files
+    n_pass = sum(1 for c in checks.values() if c['pass'])
+    n_warn = sum(1 for c in checks.values() if not c['pass'] and c.get('warning'))
+    n_fail = sum(1 for c in checks.values() if not c['pass'] and not c.get('warning'))
+
+    score = (n_pass * 2 + n_warn * 1) / (FIXED_TOTAL * 2) * 100
+
+    if has_hard_fail:
+        overall = 'FAIL'
+    elif n_fail == 0:
+        overall = 'PASS'
+    elif n_fail == 1:
+        overall = 'WARNING'
+    else:
+        overall = 'FAIL'
+
+    return {
+        'checks': checks,
+        'n_pass': n_pass,
+        'n_warn': n_warn,
+        'n_fail': n_fail,
+        'score': score,
+        'overall': overall,
+        'turns': turns,
+    }
+
+def _pdf_safe(txt: str) -> str:
+    """Maak tekst veilig voor PyFPDF pages[n].encode('latin1')."""
+    if txt is None:
+        return ""
+    s = str(txt)
+
+    # vervang probleemtekens (o.a. jouw U+2013)
+    s = (s.replace("\u2013", "-")   # en-dash –
+           .replace("\u2014", "-")   # em-dash —
+           .replace("\u2212", "-")   # minus sign −
+           .replace("\u2192", "->")  # arrow →
+           .replace("\u2026", "...") # …
+           .replace("\u00A0", " ")   # nbsp
+           .replace("\u202F", " ")   # narrow nbsp
+           .replace("\u2018", "'").replace("\u2019", "'")  # ‘ ’
+           .replace("\u201C", '"').replace("\u201D", '"')) # “ ”
+
+    # forceer latin-1 encodability (rest => ?)
+    return s.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _cell(pdf, w, h, txt="", *args, **kwargs):
+    return pdf.cell(w, h, _pdf_safe(txt), *args, **kwargs)
+
+def _multi_cell(pdf, w, h, txt="", *args, **kwargs):
+    return pdf.multi_cell(w, h, _pdf_safe(txt), *args, **kwargs)
+
+def _pdf_safe(txt: str) -> str:
+    if txt is None:
+        return ""
+    s = str(txt)
+    s = (s.replace("\u2013", "-")   # –
+           .replace("\u2014", "-")   # —
+           .replace("\u2212", "-")   # −
+           .replace("\u2192", "->")  # →
+           .replace("\u2026", "...") # …
+           .replace("\u00A0", " ")
+           .replace("\u202F", " ")
+           .replace("\u2018", "'").replace("\u2019", "'")
+           .replace("\u201C", '"').replace("\u201D", '"'))
+    return s.encode("latin-1", errors="replace").decode("latin-1")
+
+def generate_pdf_report(analyzer, quality_result, cda_params=None, comparison=None):
+    """
+    Generates a complete PDF report containing:
+    - File / ride summary
+    - Quality control results
+    - CdA analysis results (if performed)
+    - Embedded plots
+    """
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    import os
+
+    # Kies een Unicode font (TTF) van Windows
+    font_regular = r"C:\Windows\Fonts\segoeui.ttf"
+    font_bold = r"C:\Windows\Fonts\segoeuib.ttf"
+
+    if os.path.exists(font_regular) and os.path.exists(font_bold):
+        pdf.add_font("UI", "", font_regular, uni=True)
+        pdf.add_font("UI", "B", font_bold, uni=True)
+        FONT_FAMILY = "UI"
+    else:
+        # Fallback: core font (dan moet je alsnog sanitize gebruiken)
+        FONT_FAMILY = "Helvetica"
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    pdf.set_font('Helvetica', 'B', 18)
+    _cell(pdf,0, 10, 'Cycling CdA Analyzer – Analysis Report', ln=True, align='C')
+    pdf.set_font('Helvetica', '', 9)
+    _cell(pdf,0, 6, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', ln=True, align='C')
+    pdf.ln(6)
+
+    # ── Ride summary ──────────────────────────────────────────────────────────
+    df = analyzer.raw_data
+    pdf.set_font(FONT_FAMILY, 'B', 18)
+    _cell(pdf,0, 8, '1. Ride Summary', ln=True)
+    pdf.set_font(FONT_FAMILY, '', 10)
+    _cell(pdf,60, 7, f'Total records: {len(df):,}', ln=True)
+    _cell(pdf,60, 7, f'Duration: {df["time"].iloc[-1]/60:.1f} min', ln=True)
+    _cell(pdf,60, 7, f'Avg speed: {df["speed"].mean()*3.6:.1f} km/h', ln=True)
+    _cell(pdf,60, 7, f'Avg power: {df["power"].mean():.0f} W', ln=True)
+    pdf.ln(4)
+
+    # ── Quality control ───────────────────────────────────────────────────────
+    pdf.set_font('Helvetica', 'B', 13)
+    _cell(pdf,0, 8, '2. Data Quality Control', ln=True)
+    pdf.ln(2)
+
+    overall = quality_result['overall']
+    score   = quality_result['score']
+    colour  = (0, 180, 0) if overall == 'PASS' else (255, 165, 0) if overall == 'WARNING' else (220, 0, 0)
+
+    # Overall badge
+    pdf.set_fill_color(*colour)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font('Helvetica', 'B', 12)
+    _cell(pdf,60, 9, f'  Overall: {overall}  (Score: {score:.0f}%)', fill=True, ln=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
+
+    # Per-check table
+    pdf.set_font('Helvetica', 'B', 9)
+    pdf.set_fill_color(230, 230, 230)
+    _cell(pdf,65, 7, 'Check', border=1, fill=True)
+    _cell(pdf,22, 7, 'Status', border=1, fill=True, align='C')
+    _cell(pdf,0,  7, 'Detail', border=1, fill=True, ln=True)
+
+    pdf.set_font('Helvetica', '', 9)
+    for key, chk in quality_result['checks'].items():
+        if chk['pass']:
+            status_txt = 'PASS'
+            pdf.set_fill_color(220, 255, 220)
+        elif chk.get('warning'):
+            status_txt = 'WARN'
+            pdf.set_fill_color(255, 245, 200)
+        else:
+            status_txt = 'FAIL'
+            pdf.set_fill_color(255, 220, 220)
+        _cell(pdf,65, 6, chk['label'][:40], border=1, fill=True)
+        _cell(pdf,22, 6, status_txt, border=1, fill=True, align='C')
+        _cell(pdf,0,  6, chk['detail'][:65], border=1, fill=True, ln=True)
+    pdf.set_fill_color(255, 255, 255)
+    pdf.ln(6)
+
+    # ── CdA results ───────────────────────────────────────────────────────────
+    if cda_params and analyzer.cda_result is not None:
+        cda = analyzer.cda_result
+        p   = cda_params
+
+        pdf.set_font('Helvetica', 'B', 13)
+        _cell(pdf,0, 8, '3. CdA Analysis Results', ln=True)
+        pdf.ln(2)
+
+        pdf.set_font('Helvetica', 'B', 22)
+        pdf.set_text_color(30, 100, 200)
+        _cell(pdf,0, 12, f'CdA = {cda:.4f} m²', ln=True, align='C')
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+        pdf.set_font('Helvetica', '', 10)
+        params_table = [
+            ('Mass',        f'{p["mass"]:.1f} kg'),
+            ('Crr',         f'{p["crr"]:.5f}'),
+            ('Air density', f'{p["rho"]:.3f} kg/m³'),
+            ('Wind',        f'{p["wind_ms"]:+.1f} m/s'),
+            ('Pairs used',  str(len(analyzer.pairs))),
+        ]
+        for label, value in params_table:
+            _cell(pdf,60, 7, label, border='LTB')
+            _cell(pdf,0,  7, value, border='RTB', ln=True)
+        pdf.ln(4)
+
+        # ── Comparison section ────────────────────────────────────────────────────
+        if comparison:
+            bl = comparison['baseline']
+            res = comparison['result']
+            pw = comparison['ref_power']
+            delta_s = res['delta_s']
+
+            pdf.ln(6)
+            pdf.set_font('Helvetica', 'B', 13)
+            _cell(pdf, 0, 8, '4. Comparison vs Baseline', ln=True)
+            pdf.ln(2)
+
+            pdf.set_font('Helvetica', '', 10)
+            _cell(pdf, 60, 7, 'Baseline CdA', border='LTB')
+            _cell(pdf, 0, 7, f'{bl["cda"]:.4f} m2', border='RTB', ln=True)
+            _cell(pdf, 60, 7, 'Test CdA', border='LB')
+            _cell(pdf, 0, 7, f'{comparison["test_cda"]:.4f} m2', border='RB', ln=True)
+            _cell(pdf, 60, 7, 'Delta CdA', border='LB')
+            _cell(pdf, 0, 7, f'{(comparison["test_cda"] - bl["cda"]) * 1000:+.1f} cm2', border='RB', ln=True)
+            pdf.ln(4)
+
+            pdf.set_font('Helvetica', 'B', 11)
+            _cell(pdf, 0, 7, f'40km TT estimate at {pw}W:', ln=True)
+            pdf.set_font('Helvetica', '', 10)
+            t_a, t_b = res['time_a'], res['time_b']
+            _cell(pdf, 60, 7, 'Baseline time', border='LTB')
+            _cell(pdf, 0, 7, f'{int(t_a // 60)}:{int(t_a % 60):02d}  ({res["speed_a"]:.1f} km/h)', border='RTB',
+                  ln=True)
+            _cell(pdf, 60, 7, 'Test time', border='LB')
+            _cell(pdf, 0, 7, f'{int(t_b // 60)}:{int(t_b % 60):02d}  ({res["speed_b"]:.1f} km/h)', border='RB', ln=True)
+
+            verdict = 'FASTER' if delta_s > 0 else ('SLOWER' if delta_s < 0 else 'SAME')
+            _cell(pdf, 60, 7, 'Verdict', border='LB')
+            _cell(pdf, 0, 7, f'{verdict} by {abs(delta_s):.1f}s', border='RB', ln=True)
+
+        # VE closures
+        pdf.set_font('Helvetica', 'B', 11)
+        _cell(pdf,0, 7, 'VE Loop Closures (lower = better):', ln=True)
+        pdf.set_font('Helvetica', '', 10)
+        for k, lc in enumerate(analyzer.leg_closures):
+            if   abs(lc) < 0.01: verdict = 'EXCELLENT'
+            elif abs(lc) < 0.05: verdict = 'ACCEPTABLE'
+            else:                verdict = 'POOR – recheck conditions'
+            _cell(pdf,0, 6, f'  Pair {k+1}: {lc:+.4f} m  →  {verdict}', ln=True)
+
+        # GPS closures
+        if any(not np.isnan(gc) for gc in analyzer.gps_closures):
+            pdf.ln(2)
+            pdf.set_font('Helvetica', 'B', 11)
+            _cell(pdf,0, 7, 'GPS Route Closures (distance back→start):', ln=True)
+            pdf.set_font('Helvetica', '', 10)
+            for k, gc in enumerate(analyzer.gps_closures):
+                if np.isnan(gc):
+                    _cell(pdf,0, 6, f'  Pair {k+1}: no GPS', ln=True)
+                else:
+                    verdict = 'OK' if gc < 20 else ('WARN' if gc < 50 else 'LARGE')
+                    _cell(pdf,0, 6, f'  Pair {k+1}: {gc:.1f} m  →  {verdict}', ln=True)
+        pdf.ln(4)
+
+        # Embed the results plot
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            fig_res = make_results_plot(analyzer, p['crr'], p['rho'], p['mass'], p['wind_ms'])
+            fig_res.savefig(tmp.name, format='png', dpi=130,
+                            bbox_inches='tight', facecolor=PANEL_BG)
+            plt.close(fig_res)
+            tmp_path = tmp.name
+
+        pdf.add_page()
+        pdf.set_font('Helvetica', 'B', 13)
+        _cell(pdf,0, 8, '4. Analysis Plots', ln=True)
+        pdf.ln(2)
+        pdf.image(tmp_path, w=185)
+        os.unlink(tmp_path)
+
+    else:
+        pdf.set_font('Helvetica', 'I', 10)
+        _cell(pdf,0, 8, '3. CdA Analysis: not performed yet.', ln=True)
+
+    return pdf.output(dest="S").encode("latin-1")
+# ===========================================================================
+# TT estimation helpers  (keep these above main)
+# ===========================================================================
+
+def estimate_tt_time(cda, mass, crr, rho, power_w, distance_m=40000):
+    """Solve for constant speed on flat ground. Returns time in seconds."""
+    a = 0.5 * rho * cda
+    b = crr * mass * 9.81
+    c = -power_w
+    roots = np.roots([a, 0, b, c])
+    real_roots = [r.real for r in roots if abs(r.imag) < 1e-6 and r.real > 0]
+    if not real_roots:
+        return None
+    return distance_m / max(real_roots)
+
+
+def compare_cda(cda_a, cda_b, mass, crr, rho, power_w, distance_m=40000):
+    t_a = estimate_tt_time(cda_a, mass, crr, rho, power_w, distance_m)
+    t_b = estimate_tt_time(cda_b, mass, crr, rho, power_w, distance_m)
+    if t_a is None or t_b is None:
+        return None
+    return {
+        'time_a':  t_a,
+        'time_b':  t_b,
+        'delta_s': t_b - t_a,
+        'speed_a': (distance_m / t_a) * 3.6,
+        'speed_b': (distance_m / t_b) * 3.6,
+    }
+
+
+# ===========================================================================
+# Main UI  — complete rewrite
+# ===========================================================================
+
+def _quality_badge(overall):
+    if overall == 'PASS':    return '✅ PASS'
+    if overall == 'WARNING': return '⚠️ WARN'
+    return '❌ FAIL'
+
+
 def main():
     st.set_page_config(
         page_title="Cycling CdA Analyzer",
@@ -718,271 +1301,391 @@ def main():
         initial_sidebar_state="expanded",
     )
 
-    # ── Dark theme CSS ─────────────────────────────────────────────────────
     st.markdown("""
     <style>
-        .stApp            { background-color: #1a1a1a; color: #e0e0e0; }
+        .stApp { background-color: #1a1a1a; color: #e0e0e0; }
         section[data-testid="stSidebar"] { background-color: #2b2b2b; }
-        .result-card {
-            background-color: #2b2b2b;
-            border: 2px solid #3b8ed0;
-            border-radius: 12px;
-            padding: 2rem;
-            text-align: center;
-        }
-        .cda-value { color: #3b8ed0; font-size: 3rem; font-weight: bold; }
+        .cda-big  { color: #3b8ed0; font-size: 2.6rem; font-weight: bold; text-align: center; }
         .stButton>button { border-radius: 8px; }
     </style>
     """, unsafe_allow_html=True)
 
     st.title("🚴 Cycling CdA Analyzer")
-    st.markdown("**Chung Virtual Elevation Method** – Loop Closure  |  🆓 Free test version")
+    st.caption("Chung Virtual Elevation Method — upload one or more FIT files, check quality, calculate CdA, compare configurations.")
 
-    # ──────────────────────────────────────────────────────────────────────
-    # SIDEBAR
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Session state init ────────────────────────────────────────────────────
+    if 'registry' not in st.session_state:
+        st.session_state['registry'] = {}   # key → file record
+
+    registry: dict = st.session_state['registry']
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("⚙️ Configuration")
+        st.header("⚙️ Parameters")
 
-        # File upload
-        st.subheader("📁 Data")
-        uploaded_file = st.file_uploader(
-            "Upload FIT file", type=["fit"],
-            help="FIT file met power meter data van een heen-en-terug rit")
-
-        # Speed source
-        st.subheader("🏃 Speed Source")
-        spd_label = st.radio(
-            "Source", ["Speed sensor", "GPS"],
-            help="Sensor: ruw signaal (aanbevolen)\nGPS: afgeleid, 5-punt gemiddelde")
+        spd_label = st.radio("Speed source", ["Speed sensor", "GPS"])
         speed_source = "sensor" if spd_label == "Speed sensor" else "gps"
-        if speed_source == "sensor":
-            st.success("✓ Geen smoothing – raw sensor speed")
-        else:
-            st.warning("~ GPS smoothing actief (rolling mean 5 pts)")
-
-        # Parameters
-        st.subheader("📊 Parameters")
-        mass    = st.number_input("Mass (kg)",          value=95.0,   step=0.5,
-                                  min_value=40.0, max_value=200.0)
-        crr     = st.number_input("Crr (-)",            value=0.0031, step=0.0001,
-                                  format="%.4f", min_value=0.001, max_value=0.010)
-        rho     = st.number_input("Air density (kg/m³)", value=1.225, step=0.001,
-                                  format="%.3f", min_value=1.0, max_value=1.4)
-        wind_ms = st.number_input("Wind speed (m/s)",  value=0.0,    step=0.1,
-                                  min_value=-20.0, max_value=20.0,
-                                  help="+ = kopwind op heenweg  |  - = meewind")
-        st.caption("+ = kopwind heen  |  − = meewind heen")
 
         st.divider()
-        calc_btn = st.button("🔄 Calculate CdA",
-                             type="primary", use_container_width=True)
+        mass    = st.number_input("Mass (kg)",           value=95.0,   step=0.5,
+                                  min_value=40.0, max_value=200.0)
+        crr     = st.number_input("Crr (-)",             value=0.0031, step=0.0001,
+                                  format="%.4f", min_value=0.001, max_value=0.010)
+        rho     = st.number_input("Air density (kg/m³)", value=1.225,  step=0.001,
+                                  format="%.3f", min_value=1.0,   max_value=1.4)
+        wind_ms = st.number_input("Wind (m/s)",          value=0.0,    step=0.1,
+                                  min_value=-20.0, max_value=20.0,
+                                  help="+ = headwind on outbound leg")
 
-    # ──────────────────────────────────────────────────────────────────────
-    # WELCOME screen (geen bestand geladen)
-    # ──────────────────────────────────────────────────────────────────────
-    if uploaded_file is None:
+        st.divider()
+        st.subheader("📁 Upload FIT files")
+        uploaded_files = st.file_uploader(
+            "Drop one or more .fit files",
+            type=["fit"],
+            accept_multiple_files=True,
+        )
+
+        # ── Process newly uploaded files ──────────────────────────────────────
+        if uploaded_files:
+            for uf in uploaded_files:
+                fkey = f"{uf.name}_{speed_source}"
+                if fkey in registry:
+                    continue   # already loaded
+
+                with st.spinner(f"Loading {uf.name}…"):
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as tmp:
+                            tmp.write(uf.read())
+                            tmp_path = tmp.name
+
+                        az = CyclingDataAnalyzer()
+                        az.load_fit_file(tmp_path, speed_source=speed_source)
+                        os.unlink(tmp_path)
+
+                        qr = check_data_quality(
+                            az, mass=mass, crr=crr, rho=rho, wind_ms=wind_ms)
+
+                        registry[fkey] = {
+                            'name':         uf.name,
+                            'speed_source': speed_source,
+                            'analyzer':     az,
+                            'quality':      qr,
+                            'cda':          None,
+                            'cda_params':   None,
+                            'loaded_at':    datetime.now().strftime('%H:%M:%S'),
+                        }
+                        st.success(f"✓ {uf.name}")
+                    except Exception as e:
+                        st.error(f"❌ {uf.name}: {e}")
+
+        st.divider()
+        if registry and st.button("🗑️ Clear all files", use_container_width=True):
+            st.session_state['registry'] = {}
+            st.rerun()
+
+    # ── Welcome screen ────────────────────────────────────────────────────────
+    if not registry:
         c1, c2, c3 = st.columns([1, 2, 1])
         with c2:
-            st.info("👈 Upload een FIT bestand in de sidebar om te beginnen.")
+            st.info("👈 Upload one or more FIT files in the sidebar to get started.")
             st.markdown("""
-            ### Hoe werkt het?
-            1. Upload je `.fit` bestand (heen-en-terug rit, met vermogensmeter)
-            2. Stel massa, Crr, luchtdichtheid en wind in
-            3. Klik **Calculate CdA**
-            4. Bekijk de resultaten en download de rapportage
+            **Workflow**
+            1. Upload FIT file(s) — quality check runs automatically
+            2. Select a file and click **Calculate CdA**
+            3. Select two files and click **Compare** for a head-to-head report
+            4. Export a PDF report at any time
 
-            ---
-            > **Chung methode:** CdA wordt bepaald door de loop-closure fout
-            > tussen heen- en terugweg te minimaliseren. GPS-hoogte wordt
-            > **niet** gebruikt.
+            > CdA is determined by minimising VE loop-closure error between
+            > outbound and return legs (Chung method). GPS altitude is not used.
             """)
         return
 
-    # ──────────────────────────────────────────────────────────────────────
-    # LOAD  (gecached in session_state zodat de analyzer niet bij elke
-    #        slider-interactie opnieuw ingeladen wordt)
-    # ──────────────────────────────────────────────────────────────────────
-    file_key = f"{uploaded_file.name}_{speed_source}"
+    # =========================================================================
+    # FILE TABLE
+    # =========================================================================
+    st.subheader("📋 Uploaded files")
 
-    if (st.session_state.get("file_key") != file_key):
-        with st.spinner(f"⏳ Loading {uploaded_file.name} …"):
-            try:
-                # fitparse heeft een echte bestandspad nodig
-                with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as tmp:
-                    tmp.write(uploaded_file.read())
-                    tmp_path = tmp.name
+    # Build display dataframe
+    rows = []
+    for fkey, rec in registry.items():
+        qr   = rec['quality']
+        rows.append({
+            'Select':   False,
+            '_key':     fkey,
+            'File':     rec['name'],
+            'Loaded':   rec['loaded_at'],
+            'Duration': f"{rec['analyzer'].raw_data['time'].iloc[-1]/60:.1f} min",
+            'Avg speed': f"{rec['analyzer'].raw_data['speed'].mean()*3.6:.1f} km/h",
+            'Avg power': f"{rec['analyzer'].raw_data['power'].mean():.0f} W",
+            'Quality':  f"{qr['score']:.0f}%  {_quality_badge(qr['overall'])}",
+            'CdA':      f"{rec['cda']:.4f} m²" if rec['cda'] else "—",
+        })
 
-                analyzer = CyclingDataAnalyzer()
-                analyzer.load_fit_file(tmp_path, speed_source=speed_source)
-                os.unlink(tmp_path)
+    import pandas as pd
+    display_df = pd.DataFrame(rows)
 
-                st.session_state["analyzer"]   = analyzer
-                st.session_state["file_key"]   = file_key
-                st.session_state["cda_params"] = None   # reset vorig resultaat
+    edited = st.data_editor(
+        display_df.drop(columns=['_key']),
+        column_config={
+            "Select": st.column_config.CheckboxColumn("Select", default=False),
+        },
+        disabled=["File","Loaded","Duration","Avg speed","Avg power","Quality","CdA"],
+        hide_index=True,
+        use_container_width=True,
+    )
 
-            except Exception as e:
-                st.error(f"❌ Fout bij laden: {e}")
-                st.code(traceback.format_exc())
-                return
+    # Map selections back to file keys
+    selected_mask = edited['Select'].values
+    selected_keys = [display_df['_key'].iloc[i]
+                     for i, v in enumerate(selected_mask) if v]
+    n_selected = len(selected_keys)
 
-    analyzer: CyclingDataAnalyzer = st.session_state["analyzer"]
-    df = analyzer.raw_data
-    n  = len(df)
+    # =========================================================================
+    # ACTION BAR
+    # =========================================================================
+    st.markdown("---")
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
 
-    # ── Bestandsinfo ───────────────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Records",    f"{n:,}")
-    c2.metric("Duration",   f"{df['time'].iloc[-1]:.0f} s")
-    c3.metric("Avg speed",  f"{df['speed'].mean()*3.6:.1f} km/h")
-    c4.metric("Avg power",  f"{df['power'].mean():.0f} W")
+    btn_calc    = col_a.button("⚡ Calculate CdA",
+                               disabled=(n_selected != 1),
+                               use_container_width=True,
+                               help="Select exactly 1 file")
+    btn_compare = col_b.button("⚖️ Compare (2 files)",
+                               disabled=(n_selected != 2),
+                               use_container_width=True,
+                               help="Select exactly 2 files")
+    btn_qreport = col_c.button("🔍 Quality Report",
+                               disabled=(n_selected != 1),
+                               use_container_width=True,
+                               help="Select exactly 1 file")
+    btn_report  = col_d.button("📑 Analysis Report",
+                               disabled=(n_selected != 1),
+                               use_container_width=True,
+                               help="Select 1 file with a CdA result")
+    btn_delete  = col_e.button("🗑️ Remove selected",
+                               disabled=(n_selected == 0),
+                               use_container_width=True)
 
-    # ── Volledig rit overzicht ─────────────────────────────────────────────
-    with st.expander("📈 Full ride overview", expanded=False):
-        fig_raw = make_raw_overview(analyzer)
-        st.pyplot(fig_raw, use_container_width=True)
-        plt.close(fig_raw)
+    if btn_delete:
+        for k in selected_keys:
+            registry.pop(k, None)
+        st.rerun()
 
-    # ──────────────────────────────────────────────────────────────────────
-    # SEGMENT SELECTIE
-    # ──────────────────────────────────────────────────────────────────────
-    st.subheader("✂️ Segment selectie")
-    c1, c2 = st.columns(2)
-    with c1:
-        seg_start = st.slider("Start index", 0, n-2, 0)
-    with c2:
-        seg_end   = st.slider("End index",   1, n-1, n-1)
+    st.markdown("")
 
-    if seg_start >= seg_end:
-        st.warning("⚠️ Start moet kleiner zijn dan End.")
-        return
+    # =========================================================================
+    # CALCULATE CdA  (1 file selected)
+    # =========================================================================
+    if btn_calc and n_selected == 1:
+        fkey = selected_keys[0]
+        rec  = registry[fkey]
+        az   = rec['analyzer']
+        qr   = rec['quality']
 
-    # Draai turnaround detectie voor het preview
-    analyzer.set_segment(seg_start, seg_end)
-    analyzer.detect_turnarounds()
+        if qr['overall'] == 'FAIL':
+            st.error("❌ Quality check FAILED — fix the data before calculating CdA.")
+        else:
+            if qr['overall'] == 'WARNING':
+                st.warning("⚠️ Quality WARNING — proceed carefully.")
 
-    n_turns = len(analyzer.turnaround_indices)
-    if n_turns:
-        st.success(f"✅ {n_turns} keerpunt(en) automatisch gedetecteerd "
-                   f"(indices: {analyzer.turnaround_indices})")
-    else:
-        st.warning("⚠️ Geen keerpunten gevonden – check de segmentselectie")
+            with st.spinner("Calculating CdA…"):
+                try:
+                    az.set_segment(0, len(az.raw_data) - 1)
+                    cda = az.calculate_cda(mass, crr, rho, wind_ms)
+                    rec['cda'] = cda
+                    rec['cda_params'] = {
+                        'cda': cda, 'mass': mass, 'crr': crr,
+                        'rho': rho, 'wind_ms': wind_ms,
+                    }
+                    st.success(f"✅ CdA = **{cda:.4f} m²**  ({rec['name']})")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+                    st.code(traceback.format_exc())
 
-    with st.expander("🗺️ Segment overzicht", expanded=True):
-        fig_seg = make_segment_overview(analyzer)
-        st.pyplot(fig_seg, use_container_width=True)
-        plt.close(fig_seg)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # BEREKENING
-    # ──────────────────────────────────────────────────────────────────────
-    if calc_btn:
-        with st.spinner("⚙️ Berekening CdA …"):
-            try:
-                analyzer.set_segment(seg_start, seg_end)
-                cda = analyzer.calculate_cda(mass, crr, rho, wind_ms)
-                st.session_state["cda_params"] = {
-                    "cda": cda, "mass": mass, "crr": crr,
-                    "rho": rho, "wind_ms": wind_ms,
-                }
-                st.success(f"✅ CdA = **{cda:.4f} m²**")
-            except Exception as e:
-                st.error(f"❌ Berekeningsfout: {e}")
-                st.code(traceback.format_exc())
-
-    # ──────────────────────────────────────────────────────────────────────
-    # RESULTATEN
-    # ──────────────────────────────────────────────────────────────────────
-    if st.session_state.get("cda_params") and analyzer.cda_result is not None:
-        p   = st.session_state["cda_params"]
-        cda = analyzer.cda_result
+    # =========================================================================
+    # QUALITY REPORT  (1 file selected)
+    # =========================================================================
+    if btn_qreport and n_selected == 1:
+        fkey = selected_keys[0]
+        rec  = registry[fkey]
+        qr   = rec['quality']
 
         st.divider()
-        st.subheader("📊 Resultaten")
+        st.subheader(f"🔍 Quality Report — {rec['name']}")
 
-        # Groot getal
-        c1, c2, c3 = st.columns([1, 2, 1])
-        with c2:
-            st.markdown(f"""
-            <div class="result-card">
-                <div class="cda-value">{cda:.4f} m²</div>
-                <p style="color:#aaa; margin-top:.4rem;">CdA  –  Chung Virtual Elevation</p>
-            </div>
-            """, unsafe_allow_html=True)
+        overall = qr['overall']
+        score   = qr['score']
+        if overall == 'PASS':
+            st.success(f"✅ PASS — Score: {score:.0f}%  "
+                       f"({qr['n_pass']} pass, {qr['n_warn']} warn, {qr['n_fail']} fail)")
+        elif overall == 'WARNING':
+            st.warning(f"⚠️ WARNING — Score: {score:.0f}%")
+        else:
+            st.error(f"❌ FAIL — Score: {score:.0f}%")
 
-        st.markdown("")
+        for key, chk in qr['checks'].items():
+            if chk['pass']:
+                st.success(f"✅ {chk['label']}  —  {chk['detail']}")
+            elif chk.get('warning'):
+                st.warning(f"⚠️ {chk['label']}  —  {chk['detail']}")
+            else:
+                st.error(f"❌ {chk['label']}  —  {chk['detail']}")
 
-        # Detail kolommen
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Parameters:**")
-            st.table({
-                "Parameter": ["Mass", "Crr", "Air density", "Wind"],
-                "Value":     [f"{p['mass']:.1f} kg",
-                              f"{p['crr']:.5f}",
-                              f"{p['rho']:.3f} kg/m³",
-                              f"{p['wind_ms']:+.1f} m/s"],
-            })
-        with c2:
-            st.markdown("**VE Loop Closures:**")
-            for k, lc in enumerate(analyzer.leg_closures):
-                icon = "✅" if abs(lc) < 0.01 else ("⚠️" if abs(lc) < 0.05 else "❌")
+        # PDF download
+        with st.spinner("Generating quality report PDF…"):
+            pdf_bytes = generate_pdf_report(rec['analyzer'], qr, cda_params=None)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        st.download_button("⬇️ Download Quality PDF", data=pdf_bytes,
+                           file_name=f"quality_{rec['name']}_{ts}.pdf",
+                           mime="application/pdf")
+
+    # =========================================================================
+    # ANALYSIS REPORT  (1 file, needs CdA)
+    # =========================================================================
+    if btn_report and n_selected == 1:
+        fkey = selected_keys[0]
+        rec  = registry[fkey]
+
+        if rec['cda'] is None:
+            st.warning("⚠️ Calculate CdA for this file first.")
+        else:
+            az  = rec['analyzer']
+            p   = rec['cda_params']
+            qr  = rec['quality']
+            cda = rec['cda']
+
+            st.divider()
+            st.subheader(f"📊 Analysis Report — {rec['name']}")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("CdA",       f"{cda:.4f} m²")
+            c2.metric("Pairs",     len(az.pairs))
+            c3.metric("Quality",   f"{qr['score']:.0f}%  {_quality_badge(qr['overall'])}")
+
+            # VE closures
+            st.markdown("**VE Loop Closures**")
+            for k, lc in enumerate(az.leg_closures):
+                icon = '✅' if abs(lc) < 0.01 else ('⚠️' if abs(lc) < 0.05 else '❌')
                 st.markdown(f"Pair {k+1}: `{lc:+.4f} m` {icon}")
 
-            if analyzer.gps_closures:
-                st.markdown("**GPS Closures (back→start):**")
-                for k, gc in enumerate(analyzer.gps_closures):
-                    if np.isnan(gc):
-                        st.markdown(f"Pair {k+1}: geen GPS")
-                    else:
-                        icon = "✅" if gc < 20 else ("⚠️" if gc < 50 else "❌")
-                        st.markdown(f"Pair {k+1}: `{gc:.1f} m` {icon}")
+            # Plots in expander (optional, not forced on user)
+            with st.expander("📈 View analysis plots", expanded=False):
+                with st.spinner("Rendering…"):
+                    fig = make_results_plot(az, p['crr'], p['rho'], p['mass'], p['wind_ms'])
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
 
-        # Resultatenplot
-        with st.spinner("Plots genereren …"):
-            fig_res = make_results_plot(
-                analyzer, p['crr'], p['rho'], p['mass'], p['wind_ms'])
-            st.pyplot(fig_res, use_container_width=True)
+            # PDF
+            with st.spinner("Generating PDF…"):
+                pdf_bytes = generate_pdf_report(az, qr, cda_params=p)
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            st.download_button("⬇️ Download Analysis PDF", data=pdf_bytes,
+                               file_name=f"cda_{rec['name']}_{ts}.pdf",
+                               mime="application/pdf", use_container_width=True)
 
-        # ── Export ─────────────────────────────────────────────────────────
-        st.subheader("💾 Download")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # =========================================================================
+    # COMPARE  (2 files selected)
+    # =========================================================================
+    if btn_compare and n_selected == 2:
+        rec_a = registry[selected_keys[0]]
+        rec_b = registry[selected_keys[1]]
 
-        c1, c2 = st.columns(2)
-        with c1:
-            summary = {
-                "timestamp":      ts,
-                "cda_m2":         float(cda),
-                "ve_closures_m":  [float(x) for x in analyzer.leg_closures],
-                "gps_closures_m": [float(x) if not np.isnan(x) else None
-                                   for x in analyzer.gps_closures],
-                "n_legs":         len(analyzer.legs),
-                "n_pairs":        len(analyzer.pairs),
-                "wind_ms":        float(p['wind_ms']),
-                "mass_kg":        float(p['mass']),
-                "crr":            float(p['crr']),
-                "rho_kg_m3":      float(p['rho']),
-            }
+        if rec_a['cda'] is None or rec_b['cda'] is None:
+            missing = [r['name'] for r in [rec_a, rec_b] if r['cda'] is None]
+            st.warning(f"⚠️ Calculate CdA first for: {', '.join(missing)}")
+        else:
+            st.divider()
+            st.subheader("⚖️ Comparison Report")
+
+            cda_a = rec_a['cda']
+            cda_b = rec_b['cda']
+
+            # Reference power input
+            avg_pwr = (rec_a['analyzer'].raw_data['power'].mean() +
+                       rec_b['analyzer'].raw_data['power'].mean()) / 2
+            ref_power = st.number_input(
+                "Reference TT power (W) — your expected 40km effort",
+                min_value=100, max_value=600,
+                value=int(avg_pwr), step=5,
+            )
+
+            result = compare_cda(cda_a, cda_b, mass, crr, rho, ref_power)
+
+            # ── Header metrics ────────────────────────────────────────────────
+            c1, c2, c3 = st.columns(3)
+            c1.metric(f"A — {rec_a['name']}", f"{cda_a:.4f} m²",
+                      help=f"Quality: {rec_a['quality']['overall']}")
+            c2.metric(f"B — {rec_b['name']}", f"{cda_b:.4f} m²",
+                      delta=f"{(cda_b-cda_a)*1000:+.1f} cm²",
+                      delta_color="inverse",
+                      help=f"Quality: {rec_b['quality']['overall']}")
+            c3.metric("Delta CdA", f"{(cda_b-cda_a)*1000:+.1f} cm²")
+
+            # ── TT estimate ───────────────────────────────────────────────────
+            if result:
+                st.markdown(f"### 40 km TT estimate at {ref_power} W")
+                delta_s = result['delta_s']
+                verdict = ("🟢 B is FASTER" if delta_s < 0
+                           else ("🔴 B is SLOWER" if delta_s > 0 else "➡️ NO DIFFERENCE"))
+
+                c1, c2, c3 = st.columns(3)
+                ta, tb = result['time_a'], result['time_b']
+                c1.metric("A — time",
+                          f"{int(ta//60)}:{int(ta%60):02d}",
+                          help=f"{result['speed_a']:.1f} km/h")
+                c2.metric("B — time",
+                          f"{int(tb // 60)}:{int(tb % 60):02d}",
+                          delta=f"{delta_s:+.0f}s",
+                          delta_color="inverse")
+                c3.metric("Time difference", f"{abs(delta_s):.1f} s", delta=verdict,
+                          delta_color="off")
+
+                st.info(
+                    f"At {ref_power} W on a flat 40 km course, configuration B "
+                    f"(**{rec_b['name']}**) is **{verdict.split()[-1]}** "
+                    f"by **{abs(delta_s):.1f} seconds** "
+                    f"({'saving' if delta_s < 0 else 'losing'} time) "
+                    f"({abs(result['speed_b']-result['speed_a']):.2f} km/h)."
+                )
+
+            # ── Plots in expander ─────────────────────────────────────────────
+            with st.expander("📈 View plots for both files", expanded=False):
+                for label, rec in [("A", rec_a), ("B", rec_b)]:
+                    st.markdown(f"**File {label} — {rec['name']}**")
+                    p = rec['cda_params']
+                    fig = make_results_plot(
+                        rec['analyzer'], p['crr'], p['rho'], p['mass'], p['wind_ms'])
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+
+            # ── PDF export ────────────────────────────────────────────────────
+            with st.spinner("Generating comparison PDF…"):
+                comparison_data = {
+                    'baseline':  {
+                        'cda':      cda_a,
+                        'name':     rec_a['name'],
+                        'mass':     rec_a['cda_params']['mass'],
+                        'crr':      rec_a['cda_params']['crr'],
+                        'rho':      rec_a['cda_params']['rho'],
+                        'closures': list(rec_a['analyzer'].leg_closures),
+                    },
+                    'test_cda':  cda_b,
+                    'ref_power': ref_power,
+                    'result':    result,
+                }
+                pdf_bytes = generate_pdf_report(
+                    rec_b['analyzer'],
+                    rec_b['quality'],
+                    cda_params=rec_b['cda_params'],
+                    comparison=comparison_data,
+                )
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
-                "📄 Download JSON samenvatting",
-                data=json.dumps(summary, indent=2),
-                file_name=f"cda_summary_{ts}.json",
-                mime="application/json",
-                use_container_width=True)
-
-        with c2:
-            buf = io.BytesIO()
-            fig_res.savefig(buf, format="png", dpi=150,
-                            bbox_inches="tight", facecolor=PANEL_BG)
-            buf.seek(0)
-            st.download_button(
-                "🖼️ Download plot (PNG)",
-                data=buf,
-                file_name=f"cda_plot_{ts}.png",
-                mime="image/png",
-                use_container_width=True)
-
-        plt.close(fig_res)
+                "⬇️ Download Comparison PDF", data=pdf_bytes,
+                file_name=f"comparison_{ts}.pdf",
+                mime="application/pdf", use_container_width=True,
+            )
 
 
 if __name__ == "__main__":
